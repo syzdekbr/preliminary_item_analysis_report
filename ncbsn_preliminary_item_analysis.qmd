@@ -1,0 +1,666 @@
+---
+title: "NCSBN Preliminary Item Analysis"
+author: "Brian Syzdek--[Email](mailto::brians@provexam.com)"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    toc: true
+    toc-location: left
+urlcolor: blue
+editor: visual
+self-contained: true
+---
+
+```{r setup, include = FALSE}
+####**** Markdown document showing item analysis of pool of items with sample data to illustrate required data checks ###
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+
+# Libraries
+library(tidyverse)
+library(rlang) # walrus operator (:=)
+library(rpivotTable)
+
+# Helper functions for formatting tables
+source("C:/Prov/Research/helper_functions/helper_functions.R")
+
+## Function to print datatables in nice format with buttons to export
+dt_func <- function(dat, colnames = "", caption = "") {
+  # Prettify column names
+  colnames <- case_when(colnames == "" ~ pretty_columns_func(colnames(dat)),
+                        TRUE ~ colnames)
+  dat  %>%
+    DT::datatable(
+      extensions = 'Buttons',
+      colnames = colnames,
+      caption = caption,
+      rownames = FALSE,
+      editable = TRUE,
+      options = list(
+        dom = 'Blfrtip',
+        buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+        lengthMenu = list(c(10, 25, 50, -1),
+                          c(10, 25, 50, "All"))
+      )
+    )
+}
+```
+
+```{r setup-data}
+
+# Sample data, persons are rows, items as columns; column 1 is person number
+sample_dat <- purrr::map(
+  .x = 1:9,
+  .f = ~ {
+    ## Dichotomous items
+    # Tibble with columns 'item_*'; 1000 rows, random letters a-d
+    tibble(!!sym(paste0("item_", .x)) :=
+      replicate(1000,
+                list(sample(
+                  letters[1:4],
+                  size = 1,
+                  replace = TRUE)
+                  )
+                )
+      )
+    }) %>% # end dichotomous items
+  ## Polytomous item
+  # 1000 a-e values, choose 1-5, sorted alphabetically
+  bind_cols(.,
+     tibble(item_10 = 
+              replicate(1000,list(
+                # Choose letters a-e
+                sort(sample(
+                  letters[1:5],
+                  # Size of sample is variable 1-5 choices
+                  size = sample(
+                    1:5, 
+                    size = 1, 
+                    prob = rep(.2, 5)),
+                  replace = F)
+                  ))
+                )
+            )
+     ) %>% # end polytomous item
+  # Persons numbered to 1000
+  tibble::add_column(person = forcats::as_factor(1:1000), .before = 1)
+
+## Information on the items and answer key
+item_information <- tibble::tibble(
+  item_number = paste0("item_", 1:10),
+  item_type = c(rep("dichotomous", 9), "polytomous"),
+  # answer key, random; if matches -> TRUE
+  key = c(
+    # Dichotomous answer key
+    sample(
+      letters[1:4], 9, 
+      replace = TRUE),
+    # Polytomous answer key
+    list(c("a", "b", "c", "d")))
+)
+## Time data on how long each item took on average, for flag
+time_dat <- tibble::tibble(
+  item_number = paste0("item_", 1:10),
+  response_time = sample(60:150, 10, replace = TRUE)
+)
+
+```
+
+```{r long-scored-data}
+## Put item responses in long format, score- dichotomous 0,1; polytomous 0-4
+long_scored_dat <- sample_dat %>% 
+  # Long format data, item numbers and responses
+  pivot_longer(., 
+               cols = -person, 
+               names_to = "item_number", 
+               values_to = "response") %>% 
+  # Join with answer key, so each item has response and key
+  inner_join(.,
+             item_information,
+             by = "item_number") %>% 
+  rowwise() %>% 
+  ## Score each item, use %in% to generalize for dichotomous case; here just taking number correct and subtracting errors of commision, with 0 min
+  mutate(
+      score = max(
+        0,
+        sum(unlist(response) %in% unlist(key)) - # correct responses
+          sum(!unlist(response) %in% unlist(key)) # incorrect responses
+      )
+    ) 
+```
+
+```{r irt-model}
+###*** Conduct Rasch model on scored data- graded response for polytomous and generate theta for each person
+rasch_mod <- long_scored_dat %>% 
+  # Create 0,1 matrix, persons as rows, items as columns
+  pivot_wider(., id_cols = person, names_from = item_number, values_from = score) %>% 
+  dplyr::select(-person) %>% 
+  mirt::mirt(., itemtype = "Rasch", se = TRUE, 
+             verbose = FALSE) # suppress iteration results
+# Theta of each person
+person_theta <- tibble::tibble(
+  person = fct_inorder(as_factor(rasch_mod@Data$rowID)),
+  theta = as.numeric(mirt::fscores(rasch_mod))
+)
+```
+
+## Item Statistics
+
+-   Average Correct (p-value for dichotomous; average for polytomous)
+
+-   Correlation with theta (point-biserial for dichotomous; polyserial for polytomous)
+
+```{r item-level-summary}
+###*** Summary of each item- specs 1-3
+item_summary <- long_scored_dat %>% 
+  # Generate summary for each item and allow for difference with poly
+  group_by(item_number, item_type) %>% 
+  nest() %>% 
+  mutate(
+    summary_data = 
+      purrr::map2(
+        .x = data,
+        .y = item_type,
+        .f = ~{
+          # Get theta for each person
+            inner_join(.x,
+                       person_theta,
+                       by = "person") %>% 
+            summarise(
+              number_exposures = length(na.omit(response)),
+              # p-value for dich; average for poly
+              average_correct = (sum(score)) / number_exposures,
+              # Point biserial or polyserial correlation with theta
+              # Need to describe code for final implementation
+              theta_score_correlation = case_when(
+                # Point-biserial
+                .y == "dichotomous" ~ 
+                  cor.test(score, theta, method = "pearson")$estimate,
+                # Polyserial
+                TRUE ~ polycor::polyserial(theta, score)
+              )
+            )          
+        }
+      )
+  ) %>% 
+  ungroup
+
+bind_cols(
+  item_number = as_factor(item_summary$item_number),
+  item_summary$summary_data %>% bind_rows
+) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  dt_func(., caption = "Item Summary Statistics") 
+
+```
+
+## Item Statistics Summary
+
+Summary of above item-level statistics
+
+```{r item-statistics-summary}
+## Summarizes above item-level data- bullet after 1-3 in specs
+item_summary$summary_data %>% 
+  bind_rows %>% # into one df
+  # Summary stats
+  summarise(across(where(is.numeric), ~c(min(.x), max(.x), mean(.x), sd(.x)))) %>% 
+  # Label of stats
+  add_column(summary_statistic = c("min", "max", "mean", "sd"), .before = 1) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(., caption = "Summary of Item Statistics")
+```
+
+## Score Category Summary
+
+```{r score-categories}
+###*** Generate pbis for each score category
+score_pbis_dat <- person_theta %>% 
+  inner_join(.,
+             long_scored_dat, 
+             by = "person") %>% 
+  # filter(item_type == "dichotomous") %>% 
+  # New proc
+ group_by(item_number, key) %>% # To score each item
+  nest() %>% 
+  # Add the pbis results to data
+  mutate(
+    pbis_data = 
+      purrr::map2(
+        .x = data,
+        .y = item_number,
+        .f = ~{
+          .x %>% 
+      summarise(
+        # Go through and apply each item's response, code 1 for choosing it
+        map_dfr(
+          .x = unique(.$score),
+          .f = ~{
+              bind_cols(
+                # p-bis for each response
+                pbis_cor = cor.test(
+                  ifelse(score == .x, 1, 0), 
+                  theta, 
+                  method = "pearson")$estimate, 
+                score = .x)
+          } 
+        ) 
+      ) %>% 
+            add_column(item_number = .y, .before = 1)
+        }
+      )
+  ) %>% 
+  ungroup()
+  # End pbis_dat
+
+## Summary stats for each score category
+# Join person theta with long form data of each item response for each person
+person_theta %>% 
+  inner_join(.,
+             long_scored_dat, # %>% 
+               # dplyr::select(person, item_number, score),
+             by = "person") %>% 
+
+  # Order by item number, score
+  group_by(item_number = fct_inorder(item_number), score) %>% 
+  summarise(
+    count = n(),
+    avg_theta = mean(theta),
+    sd_theta = sd(theta)
+  ) %>% 
+  ungroup() %>% 
+  inner_join(.,
+             score_pbis_dat$pbis_data %>% bind_rows,
+             by = c("item_number", "score")) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(., caption = "Score Category Summary Statistics") %>% 
+ scroll_box(width = "600px", height = "500px")
+
+```
+
+## Option Statistics
+
+```{r option-statistics}
+## Create df of stats for each item option, for table and plot
+# Join theta and item
+item_response_summary_dat <- person_theta %>% 
+  inner_join(.,
+             long_scored_dat,
+             by = "person") %>% 
+  group_by(item_number) %>% 
+  # Overall stats for items
+  mutate(max_score = max(score),
+         item_count = n()
+         ) %>% 
+  group_by(item_number, response, item_count) %>% 
+  # Get count for each response
+  mutate(
+    response_count = n(),
+    relative_freq = response_count/item_count
+  ) %>% 
+  # Group by items, responses, and pass item response stats forward
+  group_by(item_number = fct_inorder(item_number), item_count,response, key, item_type, score, max_score, response_count, relative_freq) %>% 
+  # Theta for each response
+  summarise(
+    avg_theta = mean(theta),
+    sd_theta = sd(theta)
+  ) %>% 
+  # Needed for example b/c 0; remove for production
+  mutate(avg_theta = round(avg_theta, 2)) %>% 
+  rowwise() %>% 
+  # List of responses and key to string to see
+  mutate(response = paste(response, collapse = ","),
+         key = paste(key, collapse = ",")) %>% 
+  ungroup %>% 
+  group_by(item_number) %>% 
+  # Label a response as the maximum for each item or not
+  mutate(maximum_score = case_when(
+    score == max_score ~ "maximum",
+    TRUE ~ "not_max"
+  ),
+  # Range of theta for plotting
+  theta_range = max(avg_theta) - min(avg_theta)) %>%
+  # Put table in same order as plot, keyed, then response freq
+  arrange(., maximum_score, desc(relative_freq), .by_group = TRUE) %>% 
+  mutate(level_order = as_factor(paste(item_number, response, sep = "_")),
+         response = forcats::fct_inorder(as_factor(response))) %>% 
+  ungroup
+
+## Print table
+item_response_summary_dat %>% 
+  dplyr::select(item_number, response, score, response_count, relative_freq, avg_theta, sd_theta) %>% 
+  mutate(across(where(is.numeric), round, 2)) %>% 
+  table_print(., caption = "Item Response Statistics") %>% 
+ scroll_box(width = "600px", height = "500px")
+
+```
+
+### Option Plots
+
+### Dichotomous
+
+```{r response-plot-dichotomous}
+## Plots of item responses by avg theta weighted by frequency
+# Dichotomous plot
+item_response_summary_dat %>%
+  filter(item_type == "dichotomous") %>% 
+  ggplot(., aes(x = level_order, y = avg_theta, color = maximum_score)) +
+  # Weighted by relative frequency
+  geom_errorbar(aes(
+    ymin = avg_theta - (theta_range/2)*relative_freq, 
+    ymax = avg_theta + (theta_range/2)*relative_freq), 
+    position = position_dodge(width=0.9), width = 0.5) +
+  # Labels of just item number
+  scale_x_discrete(labels = function(x) gsub("item_\\d+_", "", x)) +
+  xlab("Item") + ylab("Avg Theta") + ggtitle("Item Responses by Average Theta \n Weighted by Relative Frequency") +
+  scale_color_discrete(name = "Max", labels = c("Max", "Not")) +
+  # Grid of each item; allow for different axes
+  facet_wrap(facets = ~item_number, scales = "free") 
+```
+
+### Polytomous
+
+```{r response-plot-polytomous}
+## Polytomous Plot
+item_response_summary_dat %>% 
+  filter(item_type == "polytomous") %>% 
+  group_by(item_number) %>% 
+  nest() %>% 
+  purrr::map2(
+    .x = .$data,
+    .y = .$item_number,
+    .f = ~{
+      # Print b/c inside loop
+      print(.x %>% 
+        slice_head(., n = 10) %>% # Top 10 responses
+        ggplot(., aes(
+          x = forcats::fct_rev(level_order), # Reverse b/c coord_flip
+          y = avg_theta, color = maximum_score)) +
+        geom_errorbar(aes(
+          ymin = avg_theta - (theta_range/2)*relative_freq, 
+          ymax = avg_theta + (theta_range/2)*relative_freq), 
+          position = position_dodge(width=0.9), width = 0.5) +
+        scale_x_discrete(labels = function(x) gsub("item_\\d+_", "", x)) +
+        coord_flip() + # Easier to read
+        xlab("Item") + ylab("Avg Theta") +
+        scale_color_discrete(name = "Max", labels = c("Max", "Not")) +
+        ggtitle(.y))
+    }
+  ) -> suppress_print_msg # B/c in loop, so doesn't print
+
+```
+
+```{r prepare-flag-dat}
+###*** Flag data prepared; only for dichotomous items
+
+flag_dat <- long_scored_dat %>% 
+  dplyr::filter(item_type == "dichotomous") %>% 
+  inner_join(.,
+             person_theta,
+             by = "person") %>%
+ group_by(item_number, key) %>% # To score each item
+  nest() %>% 
+  # Add the pbis results to data
+  mutate(
+    pbis_data = 
+      purrr::map2(
+        .x = data,
+        .y = item_number,
+        .f = ~{
+          .x %>% 
+      summarise(
+        # Go through and apply each item's response, code 1 for choosing it
+        map_dfr(
+          .x = unique(.$response),
+          .f = ~{
+              bind_cols(
+                # p-bis for each response
+                pbis_cor = cor.test(
+                  ifelse(response == .x, 1, 0), 
+                  theta, 
+                  method = "pearson")$estimate, 
+                response = .x)
+          } 
+        ) 
+      ) %>% 
+            add_column(item_number = .y, .before = 1)
+        }
+      )
+  )  %>% 
+  # For each item's group of pbis_data, code if item is key or distractor
+  mutate(
+    pbis_data =
+      purrr::map2(
+        .x = pbis_data,
+        .y = key,
+        .f = ~{
+          .x %>% 
+            mutate(
+              keyed = ifelse(response == .y, "key", "distractor")
+            )
+        }
+      )
+  ) %>% inner_join(.,
+                   item_summary,
+                   by = c("item_number"))
+```
+
+## Flagged Items
+
+```{r flag-functions-apply}
+###*** Create function for each flag, then apply based on conditions or selection
+
+## Flag 1
+low_keyed_pbis_low_pvalue_func <- function(){
+  flag_dat %>% 
+  purrr::map2(
+    .x = .$pbis_data,
+    .y = .$item_number,
+    .f = ~{
+      .x %>% 
+    summarise(keyed_pbis_below_0 = 
+                case_when(
+                      pbis_cor[keyed == "key"] < 0 ~ "low",
+                       TRUE ~ "normal"
+                     ),
+              keyed_pbis_below_neg_15 = 
+                case_when(
+                      pbis_cor[keyed == "key"] < -.15 ~ "low",
+                       TRUE ~ "normal"
+                     )
+              ) %>% 
+        add_column(item_number = .y, .before = 1)
+    }
+  ) %>% 
+    bind_rows %>% 
+    inner_join(.,
+               flag_dat,
+               by = "item_number") %>% 
+    rowwise() %>% 
+    mutate(
+      low_keyed_pbis_low_p_value = case_when(
+        (keyed_pbis_below_0 == "low" & summary_data$average_correct < .65) | 
+          keyed_pbis_below_neg_15 == "low" ~ "flag",
+        TRUE ~ "normal"
+      )) %>%
+    dplyr::select(item_number, low_keyed_pbis_low_p_value) %>% 
+    ungroup
+}
+
+## Flag 2
+high_distractor_pbis_func <- function(){
+  purrr::pmap(
+    flag_dat,
+    .f = function(pbis_data, data.x, item_number, ...){
+      data.x %>% 
+        group_by(response = unlist(response)) %>% 
+        count %>% 
+        ungroup() %>% 
+        inner_join(.,
+                   pbis_data,
+                   by = "response") %>% 
+    summarise(distractor_pbis_above_05 = 
+                case_when(
+                  any(pbis_cor > .05 & 
+                        n > 5 & 
+                        keyed == "distractor")
+                       ~ "flag", 
+                  TRUE ~ "normal"
+                    )
+              ) %>% 
+        add_column(item_number, .before = 1)
+  }) %>% 
+    bind_rows
+}
+
+## Flag 3
+distractor_pbis_higher_keyed <- function(){
+  purrr::pmap(
+    flag_dat,
+    .f = function(pbis_data, data.x, item_number, ...){
+      data.x %>% 
+        group_by(response = unlist(response)) %>% 
+        count %>% 
+        ungroup() %>% 
+        inner_join(.,
+                   pbis_data,
+                   by = "response") %>% 
+        {
+          . -> tmp
+          key_pbis <- tmp %>% 
+            filter(keyed == "key") %>% 
+            dplyr::select(pbis_cor) %>% 
+            pull
+          tmp %>% 
+            filter(keyed == "distractor") %>% 
+            summarise(
+              distractor_key_pbis = case_when(
+               any(pbis_cor > key_pbis & 
+                     n > 5) ~ "flag",
+               TRUE ~ "normal"
+              )
+            ) %>% 
+        add_column(item_number, .before = 1)
+        }
+    }) %>% 
+    bind_rows()
+} 
+
+## Flag 4
+low_proportion_pbis_keyed_func <- function(){
+  flag_dat %>% 
+    purrr::map2(
+      .x = .$pbis_data,
+      .y = .$item_number,
+      .f = ~{
+        .x %>% 
+          inner_join(.,
+                     item_response_summary_dat,
+                     by = c("item_number", "response")) %>% 
+          summarise(
+            low_proportion_pbis_keyed = case_when(
+              any(
+                keyed == "key" &
+                relative_freq < .25 &
+                pbis_cor < .10) ~ "flag",
+              TRUE ~ "normal"
+            )
+          ) %>% 
+          add_column(item_number = .y, .before = 1)
+      }
+    ) %>% 
+    bind_rows()
+}
+
+## Flag 5
+high_proportion_distractor_low_pbis_keyed_func <- function(){
+  flag_dat %>% 
+    purrr::map2(
+      .x = .$pbis_data,
+      .y = .$item_number,
+      .f = ~{
+        .x %>% 
+          inner_join(.,
+                     item_response_summary_dat,
+                     by = c("item_number", "response")) %>% 
+          summarise(
+            high_proportion_distractor_low_pbis_keyed = case_when(
+              any(
+                relative_freq[keyed == "distractor"] > .5 &
+                pbis_cor[keyed == "key"] < .10) ~ "flag",
+              TRUE ~ "normal"
+            )
+          ) %>% 
+          add_column(item_number = .y, .before = 1)
+      }
+    ) %>% 
+    bind_rows()
+}
+
+## Flag 6
+mean_response_time_func <- function(){
+  time_dat %>% 
+    mutate(
+      time_over_120 = case_when(
+        response_time > 120 ~ "flag",
+        TRUE ~ "normal"
+      )
+    ) %>% 
+    dplyr::select(item_number, time_over_120)
+}
+
+# Combine all flag funcs
+all_flag_funcs <- list(
+  low_keyed_pbis_low_pvalue_func(),
+  high_distractor_pbis_func(),
+  distractor_pbis_higher_keyed(),
+  low_proportion_pbis_keyed_func(),
+  high_proportion_distractor_low_pbis_keyed_func(),
+  mean_response_time_func()
+)
+
+# Flags to apply based on conditions
+  flag_funcs <- list(
+    all_flag_funcs[4],
+    all_flag_funcs[c(1,4,6)],
+    all_flag_funcs
+    )
+  # boundaries of n count
+  n_count <- list(c(0,14), c(15,49), c(50,100000))
+
+flagged_dat <- purrr::map2_dfr(
+  .x = n_count,
+  .y = flag_funcs,
+  .f = ~{
+    if(between(nrow(sample_dat), .x[1], .x[2])){
+      purrr::reduce(
+        c(
+          list(tibble(item_number = item_information$item_number)),
+          .y),
+          left_join,
+          by = "item_number"
+        ) 
+     }
+    }
+  ) %>% 
+  filter(if_any(everything(), ~.x == "flag")) 
+
+flagged_dat %>% 
+  table_print(., caption = "Flagged Items")
+
+```
+
+```{r flagged-items-plot}
+
+flagged_dat %>% 
+  pivot_longer(., cols = -item_number, names_to = "flag", values_to = "values") %>% 
+  group_by(flag) %>% 
+  summarise(count = sum(values == "flag")) %>%
+  mutate(flag = forcats::fct_rev(factor(pretty_columns_func(flag), 
+              levels = pretty_columns_func(colnames(flagged_dat)[-1])))) %>% 
+  ggplot(., aes(x = flag, y = count)) +
+  geom_col() +
+  coord_flip() +
+  ggtitle("Flag Count")
+```
